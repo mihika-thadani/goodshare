@@ -1628,7 +1628,7 @@ function App() {
       : request.status === "Pending approval"
         ? `Borrowing request sent for ${item?.name}`
         : request.status === "Upcoming"
-          ? `${item?.name} was approved. Remember your pickup date.`
+          ? `${item?.name} was approved! Chat with ${item?.lender} to arrange pickup.`
           : request.status === "Declined"
             ? `Your request for ${item?.name} was declined.`
             : request.status === "Active"
@@ -1658,7 +1658,13 @@ function App() {
   const openNotification = (notification: (typeof notifications)[number]) => {
     setReadNotifications((ids) => [...new Set([...ids, notification.id])])
     setNotificationsOpen(false)
-    if (notification.isMessage) {
+    const approvedForMe = requests.some(
+      (r) =>
+        r.id === notification.requestId &&
+        isMyBorrow(r) &&
+        notification.status === "Upcoming",
+    )
+    if (notification.isMessage || approvedForMe) {
       setThreadId(notification.requestId)
       return
     }
@@ -1753,6 +1759,8 @@ function App() {
       .eq("id", id)
     if (error) setNotice("Couldn't update that request.")
     await loadMyData(userId)
+    // Approval starts the pickup conversation
+    if (!error && status === "Upcoming") setThreadId(id)
   }
   const updateItem = async (id: string, changes: Partial<Item>) => {
     const { error } = await supabase
@@ -2129,6 +2137,7 @@ function App() {
           items={items}
           messages={messages.filter((m) => m.requestId === threadId)}
           userId={userId}
+          near={place}
           close={() => setThreadId(null)}
           send={async (body: string) => {
             const { error } = await supabase
@@ -3099,7 +3108,11 @@ function Activity({
     id: `request-${r.id}`,
     className: r.id === focusRequestId ? "focused-request" : undefined,
   })
-  const messageButton = (r: Request, label: string) => (
+  const messageButton = (r: Request, defaultLabel: string) => {
+    const label = ["Upcoming", "Active"].includes(r.status)
+      ? "Chat about pickup"
+      : defaultLabel
+    return (
     <button
       className={unreadThreads.has(r.id) ? "has-unread" : undefined}
       disabled={!r.ownerId}
@@ -3109,7 +3122,8 @@ function Activity({
       {label}
       {unreadThreads.has(r.id) && <span className="unread-dot" aria-label="unread" />}
     </button>
-  )
+    )
+  }
   const isOwnItem = (r: Request) =>
     ownerItems.some((item: Item) => item.id === r.itemId)
   const lends = requests.filter(
@@ -3878,11 +3892,26 @@ function ShareItem({
   )
 }
 
+// Pickup details travel as ordinary messages with these prefixes, so only the
+// borrower and lender (who can read the thread) ever see the exact address
+const ADDRESS_PREFIX = "📍 Pickup address: "
+const TIME_PREFIX = "🕒 Proposed pickup: "
+const CONFIRM_PREFIX = "✅ Pickup confirmed: "
+const formatPickupTime = (value: string) =>
+  new Date(value).toLocaleString(undefined, {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  })
+
 function MessageThread({
   request,
   items,
   messages,
   userId,
+  near,
   close,
   send,
   markRead,
@@ -3891,15 +3920,41 @@ function MessageThread({
   items: Item[]
   messages: Message[]
   userId: string
+  near: Place
   close: () => void
   send: (body: string) => Promise<boolean>
   markRead: () => void
 }) {
   const [draft, setDraft] = useState("")
   const [sending, setSending] = useState(false)
+  const [tool, setTool] = useState<"address" | "time" | null>(null)
+  const [address, setAddress] = useState("")
+  const [pickupAt, setPickupAt] = useState(
+    request?.start ? `${request.start}T10:00` : "",
+  )
+  const approved = request
+    ? ["Upcoming", "Active"].includes(request.status)
+    : false
+  const latest = (prefix: string) =>
+    [...messages].reverse().find((m) => m.body.startsWith(prefix))
+  const sharedAddress = latest(ADDRESS_PREFIX)
+  const proposedTime = latest(TIME_PREFIX)
+  const confirmedTime = latest(CONFIRM_PREFIX)
+  const timeIsConfirmed =
+    confirmedTime &&
+    proposedTime &&
+    confirmedTime.body.slice(CONFIRM_PREFIX.length) ===
+      proposedTime.body.slice(TIME_PREFIX.length) &&
+    confirmedTime.createdAt >= proposedTime.createdAt
+  const sendTool = async (body: string) => {
+    setSending(true)
+    if (await send(body)) setTool(null)
+    setSending(false)
+  }
   const listRef = useRef<HTMLDivElement>(null)
   const item = items.find((i) => i.id === request?.itemId)
   const iAmBorrower = request ? isMyBorrow(request) : true
+  const iAmLender = !!request && !iAmBorrower
   const neighbor = iAmBorrower
     ? item?.lender || "your neighbor"
     : request?.borrowerName || "your neighbor"
@@ -3937,12 +3992,127 @@ function MessageThread({
             ×
           </button>
         </header>
+        {approved && (
+          <div className="pickup-plan">
+            <b>Pickup plan</b>
+            <dl>
+              <div>
+                <dt>Where</dt>
+                <dd>
+                  {sharedAddress
+                    ? sharedAddress.body.slice(ADDRESS_PREFIX.length)
+                    : iAmLender
+                      ? "Share the exact pickup address"
+                      : "Waiting for the lender to share the address"}
+                </dd>
+              </div>
+              <div>
+                <dt>When</dt>
+                <dd>
+                  {proposedTime
+                    ? proposedTime.body.slice(TIME_PREFIX.length)
+                    : "Propose a pickup time"}
+                  {proposedTime && (
+                    <span className={timeIsConfirmed ? "confirmed" : "pending"}>
+                      {timeIsConfirmed ? "Confirmed" : "Awaiting confirmation"}
+                    </span>
+                  )}
+                </dd>
+              </div>
+            </dl>
+            <div className="pickup-tools">
+              {iAmLender && (
+                <button
+                  type="button"
+                  aria-pressed={tool === "address"}
+                  onClick={() => setTool(tool === "address" ? null : "address")}
+                >
+                  {sharedAddress ? "Update pickup address" : "Share pickup address"}
+                </button>
+              )}
+              <button
+                type="button"
+                aria-pressed={tool === "time"}
+                onClick={() => setTool(tool === "time" ? null : "time")}
+              >
+                {proposedTime ? "Suggest another time" : "Propose a pickup time"}
+              </button>
+              {proposedTime &&
+                !timeIsConfirmed &&
+                proposedTime.senderId !== userId && (
+                  <button
+                    type="button"
+                    className="confirm-time"
+                    disabled={sending}
+                    onClick={() =>
+                      sendTool(
+                        CONFIRM_PREFIX +
+                          proposedTime.body.slice(TIME_PREFIX.length),
+                      )
+                    }
+                  >
+                    Confirm this time
+                  </button>
+                )}
+            </div>
+            {tool === "address" && (
+              <form
+                className="pickup-tool-form"
+                onSubmit={(event) => {
+                  event.preventDefault()
+                  if (address.trim()) sendTool(ADDRESS_PREFIX + address.trim())
+                }}
+              >
+                <AddressInput
+                  required
+                  value={address}
+                  onChange={setAddress}
+                  onSelect={(place) => setAddress(place.label)}
+                  near={near}
+                  ariaLabel="Exact pickup address"
+                  placeholder="Start typing the exact address"
+                />
+                <button className="primary" disabled={!address.trim() || sending}>
+                  Share
+                </button>
+                <small>Only {neighbor} can see this address.</small>
+              </form>
+            )}
+            {tool === "time" && (
+              <form
+                className="pickup-tool-form"
+                onSubmit={(event) => {
+                  event.preventDefault()
+                  if (pickupAt) sendTool(TIME_PREFIX + formatPickupTime(pickupAt))
+                }}
+              >
+                <input
+                  required
+                  type="datetime-local"
+                  value={pickupAt}
+                  onChange={(event) => setPickupAt(event.target.value)}
+                  aria-label="Pickup date and time"
+                />
+                <button className="primary" disabled={!pickupAt || sending}>
+                  Propose
+                </button>
+              </form>
+            )}
+          </div>
+        )}
         <div className="thread-messages" ref={listRef}>
           {messages.length ? (
             messages.map((message) => (
               <div
                 key={message.id}
-                className={message.senderId === userId ? "mine" : "theirs"}
+                className={[
+                  message.senderId === userId ? "mine" : "theirs",
+                  [ADDRESS_PREFIX, TIME_PREFIX, CONFIRM_PREFIX].some((prefix) =>
+                    message.body.startsWith(prefix),
+                  )
+                    ? "pickup-message"
+                    : "",
+                ].join(" ")}
               >
                 <p>{message.body}</p>
                 <small>
@@ -3958,8 +4128,9 @@ function MessageThread({
             ))
           ) : (
             <p className="thread-empty">
-              No messages yet. Say hello and sort out pickup details with{" "}
-              {neighbor}.
+              {approved
+                ? `Approved! Use the buttons above to agree on a pickup time and place with ${neighbor}.`
+                : `No messages yet. Say hello to ${neighbor}.`}
             </p>
           )}
         </div>
