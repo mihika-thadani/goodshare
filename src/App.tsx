@@ -1,4 +1,6 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react"
+import type { Session } from "@supabase/supabase-js"
+import { PHOTO_BUCKET, supabase } from "./supabase"
 
 type Item = {
   id: string
@@ -25,7 +27,12 @@ type Item = {
   customCare?: string
   ownerId?: string
   available?: boolean
+  lat?: number
+  lng?: number
+  pickupAddress?: string
 }
+
+type Place = { label: string; lat: number; lng: number; neighborhood: string }
 
 type Request = {
   id: string
@@ -36,6 +43,24 @@ type Request = {
   status: "Pending approval" | "Upcoming" | "Active" | "Completed" | "Declined"
   borrowerId?: string
   borrowerName?: string
+  ownerId?: string | null
+}
+
+type Message = {
+  id: string
+  requestId: string
+  senderId: string
+  recipientId: string
+  senderName: string
+  body: string
+  readAt: string | null
+  createdAt: string
+}
+
+type Profile = {
+  display_name: string
+  bio: string
+  created_at?: string
 }
 
 type CommunityRequest = {
@@ -505,6 +530,233 @@ const addedSeedItems: Item[] = [
 )
 seedItems.push(...addedSeedItems)
 
+// Approximate centers of the Jersey City neighborhoods used by the sample listings
+const neighborhoodCenters: Record<string, [number, number]> = {
+  "Hamilton Park": [40.7276, -74.0453],
+  Downtown: [40.7178, -74.0431],
+  "Journal Square": [40.7328, -74.0631],
+  Newport: [40.7268, -74.034],
+  "Paulus Hook": [40.7146, -74.0336],
+  "The Heights": [40.748, -74.048],
+  "Bergen-Lafayette": [40.711, -74.065],
+  "McGinley Square": [40.726, -74.068],
+}
+const defaultPlace: Place = {
+  label: "Hamilton Park, Jersey City, NJ",
+  lat: 40.7276,
+  lng: -74.0453,
+  neighborhood: "Hamilton Park",
+}
+// Spread sample listings around their neighborhood center so they don't share one point
+for (const item of seedItems) {
+  const center = neighborhoodCenters[item.neighborhood]
+  if (!center) continue
+  const hash = [...item.id].reduce((sum, ch) => sum * 31 + ch.charCodeAt(0), 7)
+  item.lat = center[0] + ((hash % 61) - 30) / 10000
+  item.lng = center[1] + (((hash >> 6) % 61) - 30) / 10000
+}
+
+function milesBetween(a: { lat: number; lng: number }, b: { lat: number; lng: number }) {
+  const rad = (deg: number) => (deg * Math.PI) / 180
+  const dLat = rad(b.lat - a.lat)
+  const dLng = rad(b.lng - a.lng)
+  const h =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(rad(a.lat)) * Math.cos(rad(b.lat)) * Math.sin(dLng / 2) ** 2
+  return 3958.8 * 2 * Math.asin(Math.sqrt(h))
+}
+
+const stateAbbreviations: Record<string, string> = {
+  Alabama: "AL", Alaska: "AK", Arizona: "AZ", Arkansas: "AR", California: "CA",
+  Colorado: "CO", Connecticut: "CT", Delaware: "DE", "District of Columbia": "DC",
+  Florida: "FL", Georgia: "GA", Hawaii: "HI", Idaho: "ID", Illinois: "IL",
+  Indiana: "IN", Iowa: "IA", Kansas: "KS", Kentucky: "KY", Louisiana: "LA",
+  Maine: "ME", Maryland: "MD", Massachusetts: "MA", Michigan: "MI",
+  Minnesota: "MN", Mississippi: "MS", Missouri: "MO", Montana: "MT",
+  Nebraska: "NE", Nevada: "NV", "New Hampshire": "NH", "New Jersey": "NJ",
+  "New Mexico": "NM", "New York": "NY", "North Carolina": "NC",
+  "North Dakota": "ND", Ohio: "OH", Oklahoma: "OK", Oregon: "OR",
+  Pennsylvania: "PA", "Rhode Island": "RI", "South Carolina": "SC",
+  "South Dakota": "SD", Tennessee: "TN", Texas: "TX", Utah: "UT", Vermont: "VT",
+  Virginia: "VA", Washington: "WA", "West Virginia": "WV", Wisconsin: "WI",
+  Wyoming: "WY",
+}
+
+// US address lookup through Photon (OpenStreetMap data, free, no API key)
+async function searchPlaces(
+  text: string,
+  near: { lat: number; lng: number },
+  signal?: AbortSignal,
+): Promise<Place[]> {
+  const url =
+    "https://photon.komoot.io/api/?" +
+    new URLSearchParams({
+      q: text,
+      limit: "10",
+      lat: String(near.lat),
+      lon: String(near.lng),
+      location_bias_scale: "0.5",
+    })
+  const res = await fetch(url, { signal })
+  if (!res.ok) return []
+  const data = await res.json()
+  const places: Place[] = []
+  for (const feature of data.features || []) {
+    const p = feature.properties || {}
+    if (p.countrycode !== "US") continue
+    const street = [p.housenumber, p.street].filter(Boolean).join(" ")
+    const area = p.district || p.locality
+    const state = stateAbbreviations[p.state] || p.state
+    const first = p.name && p.name !== p.street ? p.name : street || area
+    const label = [
+      first,
+      p.name && p.name !== p.street && street ? street : "",
+      area && area !== first ? area : "",
+      p.city,
+      [state, p.postcode].filter(Boolean).join(" "),
+    ]
+      .filter(Boolean)
+      .join(", ")
+    if (!label || places.some((place) => place.label === label)) continue
+    places.push({
+      label,
+      lat: feature.geometry.coordinates[1],
+      lng: feature.geometry.coordinates[0],
+      neighborhood:
+        p.type === "locality" || p.type === "district"
+          ? p.name
+          : p.locality || p.district || p.city || first,
+    })
+    if (places.length === 5) break
+  }
+  return places
+}
+
+function AddressInput({
+  value,
+  onChange,
+  onSelect,
+  near,
+  placeholder,
+  ariaLabel,
+  name,
+  required,
+}: {
+  value: string
+  onChange: (value: string) => void
+  onSelect: (place: Place) => void
+  near: { lat: number; lng: number }
+  placeholder?: string
+  ariaLabel?: string
+  name?: string
+  required?: boolean
+}) {
+  const [results, setResults] = useState<Place[]>([])
+  const [open, setOpen] = useState(false)
+  const [highlighted, setHighlighted] = useState(0)
+  const [loading, setLoading] = useState(false)
+  const [touched, setTouched] = useState(false)
+  const rootRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!touched || value.trim().length < 3) {
+      setResults([])
+      return
+    }
+    const controller = new AbortController()
+    const timer = setTimeout(async () => {
+      setLoading(true)
+      try {
+        const places = await searchPlaces(value, near, controller.signal)
+        setResults(places)
+        setHighlighted(0)
+        setOpen(true)
+      } catch {
+        // Aborted or offline: keep whatever the user typed
+      } finally {
+        setLoading(false)
+      }
+    }, 250)
+    return () => {
+      clearTimeout(timer)
+      controller.abort()
+    }
+  }, [value, touched])
+
+  useEffect(() => {
+    const close = (event: MouseEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false)
+    }
+    document.addEventListener("mousedown", close)
+    return () => document.removeEventListener("mousedown", close)
+  }, [])
+
+  const choose = (place: Place) => {
+    onChange(place.label)
+    onSelect(place)
+    setTouched(false)
+    setOpen(false)
+  }
+  const showMenu = open && touched && value.trim().length >= 3
+  return (
+    <div className="address-input" ref={rootRef}>
+      <input
+        name={name}
+        required={required}
+        value={value}
+        autoComplete="off"
+        role="combobox"
+        aria-label={ariaLabel}
+        aria-expanded={showMenu}
+        aria-autocomplete="list"
+        placeholder={placeholder}
+        onChange={(e) => {
+          setTouched(true)
+          onChange(e.target.value)
+        }}
+        onFocus={() => results.length && setOpen(true)}
+        onKeyDown={(e) => {
+          if (!showMenu || !results.length) return
+          if (e.key === "ArrowDown") {
+            e.preventDefault()
+            setHighlighted((h) => (h + 1) % results.length)
+          } else if (e.key === "ArrowUp") {
+            e.preventDefault()
+            setHighlighted((h) => (h - 1 + results.length) % results.length)
+          } else if (e.key === "Enter") {
+            e.preventDefault()
+            choose(results[highlighted])
+          } else if (e.key === "Escape") {
+            setOpen(false)
+          }
+        }}
+      />
+      {showMenu && (
+        <div className="address-menu" role="listbox">
+          {results.map((place, index) => (
+            <button
+              type="button"
+              role="option"
+              aria-selected={index === highlighted}
+              className={index === highlighted ? "highlighted" : ""}
+              key={place.label}
+              onMouseEnter={() => setHighlighted(index)}
+              onClick={() => choose(place)}
+            >
+              <LucideIcon name="map-pin" />
+              <span>{place.label}</span>
+            </button>
+          ))}
+          {!results.length && (
+            <p>{loading ? "Searching addresses…" : "No matching US addresses"}</p>
+          )}
+          <small>Address data © OpenStreetMap contributors</small>
+        </div>
+      )}
+    </div>
+  )
+}
+
 const categories = [
   "All categories",
   "Sports & Outdoors",
@@ -522,11 +774,124 @@ const interests = [
   "Music & creativity",
   "Sharing my belongings",
 ]
-const currentUserId = "user-jamie"
-// Neighbors used to simulate incoming borrow requests on the current user's listings
-const demoNeighbors = ["Ana", "Ben", "Chloe", "Dev", "Ines", "Marcus"]
+// Signed-in user's id, kept in sync with the Supabase session in App
+let currentUserId = ""
 const isMyBorrow = (request: Request) =>
   !request.borrowerId || request.borrowerId === currentUserId
+
+const sampleItems: Item[] = seedItems.map((item) => ({
+  ...item,
+  ownerId: `seed-owner-${item.lender.toLowerCase()}`,
+  available: true,
+}))
+
+const listingFromRow = (row: any): Item => ({
+  id: row.id,
+  ownerId: row.owner_id,
+  lender: row.lender_name,
+  name: row.name,
+  category: row.category,
+  occasion: row.occasion,
+  price: Number(row.price),
+  sharingOption: row.sharing_option,
+  brand: row.brand,
+  color: row.color,
+  guarantee: Number(row.guarantee),
+  distance: 0.3,
+  neighborhood: row.neighborhood,
+  lat: row.lat ?? undefined,
+  lng: row.lng ?? undefined,
+  image: row.image_url || photos.party,
+  description: row.description,
+  condition: row.condition,
+  accessories: row.accessories,
+  care: row.care,
+  careInstructions: row.care_instructions || [],
+  customCare: row.custom_care,
+  availability: row.availability,
+  available: row.available,
+  source: "community",
+})
+
+// Coordinates are rounded to ~100 m so a home address can't be read back
+const roundCoord = (value?: number) =>
+  value == null ? null : Math.round(value * 1000) / 1000
+const listingToRow = (item: Partial<Item>) => {
+  const row: Record<string, unknown> = {
+    name: item.name,
+    category: item.category,
+    occasion: item.occasion,
+    price: item.price,
+    sharing_option: item.sharingOption,
+    brand: item.brand,
+    color: item.color,
+    guarantee: item.guarantee,
+    neighborhood: item.neighborhood,
+    image_url: item.image,
+    description: item.description,
+    condition: item.condition,
+    accessories: item.accessories,
+    care: item.care,
+    care_instructions: item.careInstructions,
+    custom_care: item.customCare,
+    availability: item.availability,
+    available: item.available,
+    lender_name: item.lender,
+  }
+  if ("lat" in item) row.lat = roundCoord(item.lat)
+  if ("lng" in item) row.lng = roundCoord(item.lng)
+  for (const key of Object.keys(row)) if (row[key] === undefined) delete row[key]
+  return row
+}
+
+const requestFromRow = (row: any): Request => ({
+  id: row.id,
+  itemId: row.listing_id,
+  start: row.start_date,
+  end: row.end_date,
+  days: row.days,
+  status: row.status,
+  borrowerId: row.borrower_id,
+  borrowerName: row.borrower_name,
+  ownerId: row.owner_id,
+})
+
+const messageFromRow = (row: any): Message => ({
+  id: row.id,
+  requestId: row.request_id,
+  senderId: row.sender_id,
+  recipientId: row.recipient_id,
+  senderName: row.sender_name,
+  body: row.body,
+  readAt: row.read_at,
+  createdAt: row.created_at,
+})
+
+const communityFromRow = (row: any): CommunityRequest => ({
+  id: row.id,
+  item: row.item,
+  posted: new Date(row.created_at).toLocaleDateString(undefined, {
+    month: "short",
+    day: "numeric",
+  }),
+  neighborhood: row.neighborhood,
+  status: row.status,
+  responses: row.responses,
+  owner: "current",
+})
+
+// Listing photos picked in the form are data URLs; store them in Supabase
+async function uploadPhoto(image: string, userId: string) {
+  if (!image.startsWith("data:")) return image
+  const blob = await (await fetch(image)).blob()
+  const ext = blob.type.split("/")[1]?.replace("jpeg", "jpg") || "jpg"
+  const path = `${userId}/${Date.now()}.${ext}`
+  const { error } = await supabase.storage
+    .from(PHOTO_BUCKET)
+    .upload(path, blob, { contentType: blob.type })
+  if (error) throw error
+  return supabase.storage.from(PHOTO_BUCKET).getPublicUrl(path).data.publicUrl
+}
 
 function daysBetween(a: string, b: string) {
   if (!a || !b) return 0
@@ -964,11 +1329,13 @@ function Dropdown({
 
 function App() {
   const [onboarded, setOnboarded] = useState(
-    () => localStorage.getItem("goodshare-onboarded") === "true",
+    () =>
+      localStorage.getItem("goodshare-onboarded") === "true" ||
+      new URLSearchParams(window.location.search).has("request"),
   )
   const [step, setStep] = useState(0)
   const [page, setPage] =
-    useState<"explore" | "results" | "item" | "request" | "activity" | "share" | "community" | "profile" | "settings" | "help" | "contact" | "guidelines" | "privacy" | "terms">(
+    useState<"explore" | "results" | "item" | "request" | "activity" | "share" | "community" | "profile" | "settings" | "help" | "contact" | "guidelines" | "privacy" | "terms" | "auth">(
       "explore",
     )
   const [location, setLocation] = useState(
@@ -976,54 +1343,42 @@ function App() {
       localStorage.getItem("goodshare-location") ||
       "Hamilton Park, Jersey City",
   )
+  // The searched location's coordinates, used to measure distance to listings
+  const [place, setPlace] = useState<Place>(() => {
+    try {
+      return JSON.parse(localStorage.getItem("goodshare-place") || "") as Place
+    } catch {
+      return defaultPlace
+    }
+  })
+  const choosePlace = (next: Place) => {
+    setPlace(next)
+    setLocation(next.label)
+    localStorage.setItem("goodshare-place", JSON.stringify(next))
+    localStorage.setItem("goodshare-location", next.label)
+  }
   const [radius, setRadius] = useState(3)
   const [chosenInterests, setChosenInterests] = useState<string[]>([])
-  const [items, setItems] = useState<Item[]>(() => {
-    const saved: Item[] | null = JSON.parse(
-      localStorage.getItem("goodshare-items") || "null",
-    )
-    if (!saved)
-      return seedItems.map((item) => ({
-        ...item,
-        ownerId: `seed-owner-${item.lender.toLowerCase()}`,
-        available: true,
-      }))
-    const normalized = saved.map((item) => {
-      const currentSeed = seedItems.find((seed) => seed.id === item.id)
-      return {
-        ...(currentSeed || item),
-        ...item,
-        category:
-          item.category === "Musical Instruments"
-            ? "Musical Instruments"
-            : item.category === "Party Essentials"
-              ? "Party Essentials"
-              : item.category,
-        image: currentSeed?.image || item.image,
-        availability: item.availability || "Available this week",
-        source: item.id.startsWith("user-") ? "community" : "seeded",
-        ownerId:
-          item.ownerId ||
-          (item.id.startsWith("user-")
-            ? currentUserId
-            : `seed-owner-${item.lender.toLowerCase()}`),
-        available: item.available !== false,
-      } as Item
-    })
-    return [
-      ...normalized,
-      ...seedItems.filter(
-        (seed) => !normalized.some((item) => item.id === seed.id),
-      ),
-    ]
-  })
-  const [requests, setRequests] = useState<Request[]>(() =>
-    JSON.parse(localStorage.getItem("goodshare-requests") || "[]"),
+  const [session, setSession] = useState<Session | null>(null)
+  const [authReady, setAuthReady] = useState(false)
+  const [profile, setProfile] = useState<Profile | null>(null)
+  const [afterAuth, setAfterAuth] = useState<typeof page>("explore")
+  const [authMode, setAuthMode] = useState<"signin" | "signup" | "reset">(
+    "signin",
   )
-  const [communityRequests, setCommunityRequests] =
-    useState<CommunityRequest[]>(() =>
-      JSON.parse(localStorage.getItem("goodshare-community-requests") || "[]"),
-    )
+  const userId = session?.user.id || ""
+  const [memberItems, setMemberItems] = useState<Item[]>([])
+  const items = useMemo(() => [...memberItems, ...sampleItems], [memberItems])
+  const [requests, setRequests] = useState<Request[]>([])
+  const [messages, setMessages] = useState<Message[]>([])
+  const [threadId, setThreadId] = useState<string | null>(null)
+  // Request opened from an email link (?request=<id>)
+  const [focusRequestId, setFocusRequestId] = useState<string | null>(() =>
+    new URLSearchParams(window.location.search).get("request"),
+  )
+  const [communityRequests, setCommunityRequests] = useState<
+    CommunityRequest[]
+  >([])
   const [activityTab, setActivityTab] =
     useState<"Borrowing" | "Lending" | "My Requests">("Borrowing")
   const [selectedId, setSelectedId] = useState("pickle")
@@ -1037,39 +1392,130 @@ function App() {
   const [end, setEnd] = useState("")
   const [agreed, setAgreed] = useState(false)
   const [notice, setNotice] = useState("")
+  const [editingItem, setEditingItem] = useState<Item | null>(null)
   const [menu, setMenu] = useState(false)
   const [notificationsOpen, setNotificationsOpen] = useState(false)
   const [profileOpen, setProfileOpen] = useState(false)
   const profileMenuRef = useRef<HTMLDivElement>(null)
   const notificationsRef = useRef<HTMLDivElement>(null)
-  const [readNotifications, setReadNotifications] = useState<string[]>(() =>
-    JSON.parse(localStorage.getItem("goodshare-read-notifications") || "[]"),
-  )
+  // Read notifications are remembered per account, so two accounts on one
+  // browser don't mark each other's notifications as read
+  const [readNotifications, setReadNotifications] = useState<string[]>([])
+  const [readLoadedFor, setReadLoadedFor] = useState<string | null>(null)
+  const readKey = `goodshare-read-notifications-${userId}`
 
-  useEffect(
-    () => localStorage.setItem("goodshare-items", JSON.stringify(items)),
-    [items],
-  )
-  useEffect(
-    () => localStorage.setItem("goodshare-requests", JSON.stringify(requests)),
-    [requests],
-  )
-  useEffect(
-    () =>
-      localStorage.setItem(
-        "goodshare-community-requests",
-        JSON.stringify(communityRequests),
-      ),
-    [communityRequests],
-  )
-  useEffect(
-    () =>
-      localStorage.setItem(
-        "goodshare-read-notifications",
-        JSON.stringify(readNotifications),
-      ),
-    [readNotifications],
-  )
+  const loadListings = async () => {
+    const { data, error } = await supabase
+      .from("listings")
+      .select("*")
+      .order("created_at", { ascending: false })
+    if (error) setNotice("Couldn't load shared listings. Showing samples only.")
+    else setMemberItems(data.map(listingFromRow))
+  }
+  const loadMyData = async (id: string) => {
+    if (!id) {
+      setRequests([])
+      setMessages([])
+      setCommunityRequests([])
+      setProfile(null)
+      return
+    }
+    const [requestRows, messageRows, communityRows, profileRow] =
+      await Promise.all([
+      supabase.from("requests").select("*").order("created_at"),
+      supabase.from("messages").select("*").order("created_at"),
+      supabase
+        .from("community_requests")
+        .select("*")
+        .eq("owner_id", id)
+        .order("created_at", { ascending: false }),
+      supabase.from("profiles").select("*").eq("id", id).maybeSingle(),
+    ])
+    setRequests((requestRows.data || []).map(requestFromRow))
+    setMessages((messageRows.data || []).map(messageFromRow))
+    setCommunityRequests((communityRows.data || []).map(communityFromRow))
+    setProfile(profileRow.data)
+  }
+  useEffect(() => {
+    loadListings()
+    supabase.auth.getSession().then(({ data }) => {
+      currentUserId = data.session?.user.id || ""
+      setSession(data.session)
+      setAuthReady(true)
+      loadMyData(currentUserId)
+    })
+    const { data } = supabase.auth.onAuthStateChange((event, next) => {
+      currentUserId = next?.user.id || ""
+      setSession(next)
+      if (event === "SIGNED_IN" || event === "SIGNED_OUT")
+        loadMyData(currentUserId)
+      if (event === "PASSWORD_RECOVERY") {
+        setAuthMode("reset")
+        setPage("auth")
+      }
+    })
+    return () => data.subscription.unsubscribe()
+  }, [])
+  // Arriving from a "new request" email: go straight to that request
+  useEffect(() => {
+    const fromLink = new URLSearchParams(window.location.search).get("request")
+    if (!fromLink || !authReady) return
+    window.history.replaceState(null, "", window.location.pathname)
+    setFocusRequestId(fromLink)
+    setActivityTab("Lending")
+    if (requireSignIn("activity")) navigate("activity")
+  }, [authReady])
+  const displayName = profile?.display_name || "Neighbor"
+  const initials =
+    displayName
+      .split(/\s+/)
+      .map((part) => part[0])
+      .join("")
+      .slice(0, 2)
+      .toUpperCase() || "?"
+  // Send signed-out visitors to sign in, then on to where they were headed
+  const requireSignIn = (next: typeof page) => {
+    if (userId) return true
+    setAfterAuth(next)
+    setAuthMode("signin")
+    navigate("auth")
+    return false
+  }
+  useEffect(() => {
+    try {
+      setReadNotifications(JSON.parse(localStorage.getItem(readKey) || "[]"))
+    } catch {
+      setReadNotifications([])
+    }
+    setReadLoadedFor(userId)
+  }, [userId])
+  useEffect(() => {
+    if (userId && readLoadedFor === userId)
+      localStorage.setItem(readKey, JSON.stringify(readNotifications))
+  }, [readNotifications, readLoadedFor])
+  // Live updates: refresh when a request or message involving this user changes
+  useEffect(() => {
+    if (!userId) return
+    const refresh = () => loadMyData(userId)
+    const channel = supabase
+      .channel(`activity-${userId}`)
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "requests" },
+        refresh,
+      )
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "messages" },
+        refresh,
+      )
+      .subscribe()
+    window.addEventListener("focus", refresh)
+    return () => {
+      supabase.removeChannel(channel)
+      window.removeEventListener("focus", refresh)
+    }
+  }, [userId])
   useEffect(() => {
     if (notice) {
       const t = setTimeout(() => setNotice(""), 3000)
@@ -1099,9 +1545,26 @@ function App() {
     }
   }, [])
 
-  const selected = items.find((i) => i.id === selectedId) || items[0]
+  const located = useMemo(
+    () =>
+      items.map((item) =>
+        item.lat != null && item.lng != null
+          ? {
+              ...item,
+              distance: Math.max(
+                0.1,
+                Math.round(
+                  milesBetween(place, { lat: item.lat, lng: item.lng }) * 10,
+                ) / 10,
+              ),
+            }
+          : item,
+      ),
+    [items, place],
+  )
+  const selected = located.find((i) => i.id === selectedId) || located[0]
   const filtered = useMemo(() => {
-    let list = items.filter(
+    let list = located.filter(
       (i) =>
         (!query ||
           [i.name, i.category, i.description, i.keywords || ""]
@@ -1116,8 +1579,6 @@ function App() {
           sharingModels.includes(
             i.sharingOption || (i.price === 0 ? "free" : "fixed"),
           )) &&
-        (location.toLowerCase().includes("jersey city") ||
-          i.neighborhood.toLowerCase().includes(location.toLowerCase())) &&
         i.guarantee <= maxGuarantee &&
         (!start ||
           !end ||
@@ -1137,7 +1598,7 @@ function App() {
           : a.distance - b.distance,
     )
   }, [
-    items,
+    located,
     query,
     category,
     occasion,
@@ -1176,9 +1637,36 @@ function App() {
     return {
       id: `${request.id}-${request.status}`,
       copy,
-      status: request.status,
+      status: request.status as string,
+      requestId: request.id,
+      isMessage: false,
     }
   })
+  notifications.reverse()
+  notifications.unshift(
+    ...messages
+      .filter((message) => message.recipientId === userId)
+      .reverse()
+      .map((message) => ({
+        id: `msg-${message.id}`,
+        copy: `${message.senderName}: ${message.body.slice(0, 90)}`,
+        status: "New message",
+        requestId: message.requestId,
+        isMessage: true,
+      })),
+  )
+  const openNotification = (notification: (typeof notifications)[number]) => {
+    setReadNotifications((ids) => [...new Set([...ids, notification.id])])
+    setNotificationsOpen(false)
+    if (notification.isMessage) {
+      setThreadId(notification.requestId)
+      return
+    }
+    const request = requests.find((r) => r.id === notification.requestId)
+    setActivityTab(request && !isMyBorrow(request) ? "Lending" : "Borrowing")
+    setFocusRequestId(notification.requestId)
+    navigate("activity")
+  }
   const unreadCount = notifications.filter(
     (notification) => !readNotifications.includes(notification.id),
   ).length
@@ -1201,16 +1689,29 @@ function App() {
     setMaxGuarantee(100)
     navigate("results")
   }
-  const doSearch = (e?: FormEvent) => {
+  const doSearch = async (e?: FormEvent) => {
     e?.preventDefault()
+    // Typed a location without picking a suggestion: use the best match
+    if (location.trim() && location !== place.label) {
+      try {
+        const [best] = await searchPlaces(location, place)
+        if (best) choosePlace(best)
+      } catch {
+        // Offline: keep the previous location
+      }
+    }
     navigate("results")
   }
   const finishOnboarding = () => {
     localStorage.setItem("goodshare-onboarded", "true")
     localStorage.setItem("goodshare-location", location)
+    if (location.trim() && location !== place.label)
+      searchPlaces(location, place)
+        .then(([best]) => best && choosePlace(best))
+        .catch(() => {})
     setOnboarded(true)
   }
-  const submitRequest = () => {
+  const submitRequest = async () => {
     if (selected.ownerId === currentUserId) {
       setNotice("You cannot request to borrow your own listing.")
       return
@@ -1228,54 +1729,75 @@ function App() {
       setNotice("Please acknowledge the borrowing agreement.")
       return
     }
-    setRequests((r) => [
-      ...r,
-      {
-        id: Date.now().toString(),
-        itemId: selected.id,
-        start,
-        end,
-        days,
-        status: "Pending approval",
-        borrowerId: currentUserId,
-      },
-    ])
+    if (!requireSignIn("request")) return
+    const { error } = await supabase.from("requests").insert({
+      listing_id: selected.id,
+      start_date: start,
+      end_date: end,
+      days,
+      borrower_name: displayName,
+    })
+    if (error) {
+      setNotice("Couldn't send your request. Please try again.")
+      return
+    }
+    await loadMyData(userId)
+    setActivityTab("Borrowing")
     setNotice("Request sent to " + selected.lender)
     navigate("activity")
   }
-  const updateRequest = (id: string, status: Request["status"]) =>
-    setRequests((r) => r.map((x) => (x.id === id ? { ...x, status } : x)))
-  const simulateNeighborRequest = (item: Item) => {
-    const name = demoNeighbors[Math.floor(Math.random() * demoNeighbors.length)]
-    const start = new Date()
-    const end = new Date(start)
-    end.setDate(start.getDate() + 2)
-    setRequests((r) => [
-      ...r,
-      {
-        id: Date.now().toString(),
-        itemId: item.id,
-        start: start.toISOString().slice(0, 10),
-        end: end.toISOString().slice(0, 10),
-        days: 2,
-        status: "Pending approval",
-        borrowerId: `neighbor-${name.toLowerCase()}`,
-        borrowerName: name,
-      },
-    ])
-    setNotice(`${name} requested to borrow your ${item.name}.`)
+  const updateRequest = async (id: string, status: Request["status"]) => {
+    const { error } = await supabase
+      .from("requests")
+      .update({ status })
+      .eq("id", id)
+    if (error) setNotice("Couldn't update that request.")
+    await loadMyData(userId)
   }
-  const updateItem = (id: string, changes: Partial<Item>) =>
-    setItems((current) =>
-      current.map((item) => (item.id === id ? { ...item, ...changes } : item)),
-    )
+  const updateItem = async (id: string, changes: Partial<Item>) => {
+    const { error } = await supabase
+      .from("listings")
+      .update(listingToRow(changes))
+      .eq("id", id)
+    if (error) setNotice("Couldn't save that change.")
+    await loadListings()
+    return !error
+  }
+  const startShare = () => {
+    if (!requireSignIn("share")) return
+    setEditingItem(null)
+    navigate("share")
+  }
   const editItem = (item: Item) => {
-    const name = prompt("Item name", item.name)
-    if (!name?.trim()) return
-    const description = prompt("Description", item.description)
-    if (description === null) return
-    updateItem(item.id, { name: name.trim(), description: description.trim() })
-    setNotice("Listing updated.")
+    setEditingItem(item)
+    navigate("share")
+  }
+  const publishItem = async (item: Item, isNew: boolean) => {
+    try {
+      const image = await uploadPhoto(item.image, userId)
+      const row = listingToRow({ ...item, image, lender: displayName })
+      const { error } = isNew
+        ? await supabase.from("listings").insert(row)
+        : await supabase.from("listings").update(row).eq("id", item.id)
+      if (error) throw error
+    } catch {
+      setNotice("Couldn't save your listing. Please try again.")
+      return
+    }
+    await loadListings()
+    setEditingItem(null)
+    setActivityTab("Lending")
+    setNotice(
+      isNew
+        ? "Your item is live! Neighbors can now request to borrow it."
+        : "Listing updated.",
+    )
+    navigate("activity")
+  }
+  const signOut = async () => {
+    await supabase.auth.signOut()
+    setProfileOpen(false)
+    navigate("explore")
   }
 
   if (!onboarded)
@@ -1285,6 +1807,8 @@ function App() {
         setStep={setStep}
         location={location}
         setLocation={setLocation}
+        place={place}
+        choosePlace={choosePlace}
         radius={radius}
         setRadius={setRadius}
         chosen={chosenInterests}
@@ -1302,9 +1826,23 @@ function App() {
         <nav className={menu ? "open" : ""}>
           <button onClick={showAllListings}>Explore</button>
           <button onClick={() => navigate("community")}>Community</button>
-          <button onClick={() => navigate("activity")}>My Shares</button>
+          <button
+            onClick={() => requireSignIn("activity") && navigate("activity")}
+          >
+            My Shares
+          </button>
         </nav>
         <div className="nav-actions">
+          {!userId && (
+            <button
+              className="primary sign-in-button"
+              onClick={() => requireSignIn("explore")}
+            >
+              Sign in
+            </button>
+          )}
+          {userId && (
+          <>
           <div className="notification-wrap" ref={notificationsRef}>
             <button
               className="notification-button"
@@ -1352,11 +1890,7 @@ function App() {
                           : ""
                       }
                       key={notification.id}
-                      onClick={() =>
-                        setReadNotifications((ids) => [
-                          ...new Set([...ids, notification.id]),
-                        ])
-                      }
+                      onClick={() => openNotification(notification)}
                     >
                       <b>{notification.status}</b>
                       <span>{notification.copy}</span>
@@ -1378,7 +1912,7 @@ function App() {
               aria-expanded={profileOpen}
               onClick={() => setProfileOpen(!profileOpen)}
             >
-              JS
+              {initials}
             </button>
             {profileOpen && (
               <div className="profile-dropdown">
@@ -1407,17 +1941,15 @@ function App() {
                   Help &amp; Support
                 </button>
                 <button
-                  onClick={() => {
-                    localStorage.setItem("goodshare-onboarded", "false")
-                    setOnboarded(false)
-                    setProfileOpen(false)
-                  }}
+                  onClick={signOut}
                 >
                   Log Out
                 </button>
               </div>
             )}
           </div>
+          </>
+          )}
         </div>
         <button
           className="hamburger"
@@ -1435,7 +1967,9 @@ function App() {
           setQuery={setQuery}
           search={doSearch}
           location={location}
-          items={items.filter((item) => item.available !== false)}
+          items={located
+            .filter((item) => item.available !== false)
+            .sort((a, b) => a.distance - b.distance)}
           openItem={openItem}
           chooseOccasion={(o) => {
             setOccasion([o])
@@ -1446,11 +1980,13 @@ function App() {
             navigate("results")
           }}
           setLocation={setLocation}
+          place={place}
+          choosePlace={choosePlace}
           start={start}
           end={end}
           setStart={setStart}
           setEnd={setEnd}
-          share={() => navigate("share")}
+          share={startShare}
         />
       )}
       {page === "results" && (
@@ -1473,6 +2009,8 @@ function App() {
           openItem={openItem}
           location={location}
           setLocation={setLocation}
+          place={place}
+          choosePlace={choosePlace}
           start={start}
           end={end}
           setStart={setStart}
@@ -1483,7 +2021,7 @@ function App() {
         <ItemDetail
           item={selected}
           back={() => navigate("results")}
-          request={() => navigate("request")}
+          request={() => requireSignIn("request") && navigate("request")}
           isOwner={selected.ownerId === currentUserId}
           edit={() => editItem(selected)}
           toggleAvailability={() =>
@@ -1509,20 +2047,32 @@ function App() {
           items={items}
           update={updateRequest}
           openItem={openItem}
-          share={() => navigate("share")}
+          share={startShare}
           support={() => navigate("help")}
           tab={activityTab}
           setTab={setActivityTab}
           communityRequests={communityRequests}
-          updateCommunityRequest={(id, changes) =>
-            setCommunityRequests((current) =>
-              current.map((request) =>
-                request.id === id ? { ...request, ...changes } : request,
-              ),
+          updateCommunityRequest={async (
+            id: string,
+            changes: Partial<CommunityRequest>,
+          ) => {
+            const { error } = await supabase
+              .from("community_requests")
+              .update({ item: changes.item, status: changes.status })
+              .eq("id", id)
+            if (error) setNotice("Couldn't update that request.")
+            await loadMyData(userId)
+          }}
+          ownerItems={items.filter((item) => item.ownerId === userId)}
+          focusRequestId={focusRequestId}
+          openThread={setThreadId}
+          unreadThreads={
+            new Set(
+              messages
+                .filter((m) => m.recipientId === userId && !m.readAt)
+                .map((m) => m.requestId),
             )
           }
-          ownerItems={items.filter((item) => item.ownerId === currentUserId)}
-          simulateRequest={simulateNeighborRequest}
           editItem={editItem}
           toggleItem={(item) =>
             updateItem(item.id, { available: item.available === false })
@@ -1530,42 +2080,94 @@ function App() {
           removeItem={(item) => {
             if (!confirm(`Remove “${item.name}”? This cannot be undone.`))
               return
-            setItems((current) =>
-              current.filter((candidate) => candidate.id !== item.id),
-            )
-            setNotice("Listing removed.")
+            supabase
+              .from("listings")
+              .delete()
+              .eq("id", item.id)
+              .then(({ error }) => {
+                setNotice(error ? "Couldn't remove that listing." : "Listing removed.")
+                loadListings()
+              })
           }}
         />
       )}
       {page === "share" && (
         <ShareItem
-          add={(item) => {
-            const ownedItem = {
-              ...item,
-              ownerId: currentUserId,
-              available: true,
-            }
-            const nextItems = [ownedItem, ...items]
-            localStorage.setItem("goodshare-items", JSON.stringify(nextItems))
-            setItems(nextItems)
-            setActivityTab("Lending")
-            setNotice(
-              "Your item is live! Neighbors can now request to borrow it.",
-            )
-            navigate("activity")
-          }}
+          key={editingItem?.id || "new"}
+          existing={editingItem}
+          near={place}
+          save={(item: Item) => publishItem(item, false)}
+          add={(item: Item) => publishItem({ ...item, available: true }, true)}
         />
       )}
       {page === "community" && (
         <Community
           location={location}
           requests={communityRequests}
-          addRequest={(request) =>
-            setCommunityRequests((current) => [request, ...current])
-          }
+          addRequest={async (request: CommunityRequest) => {
+            if (!requireSignIn("community")) return false
+            const { error } = await supabase
+              .from("community_requests")
+              .insert({ item: request.item, neighborhood: request.neighborhood })
+            if (error) {
+              setNotice("Couldn't post your request. Please try again.")
+              return false
+            }
+            await loadMyData(userId)
+            return true
+          }}
           viewMyRequests={() => {
+            if (!requireSignIn("activity")) return
             setActivityTab("My Requests")
             navigate("activity")
+          }}
+        />
+      )}
+      {threadId && (
+        <MessageThread
+          request={requests.find((r) => r.id === threadId)}
+          items={items}
+          messages={messages.filter((m) => m.requestId === threadId)}
+          userId={userId}
+          close={() => setThreadId(null)}
+          send={async (body: string) => {
+            const { error } = await supabase
+              .from("messages")
+              .insert({ request_id: threadId, body })
+            if (error) {
+              setNotice("Couldn't send your message. Please try again.")
+              return false
+            }
+            await loadMyData(userId)
+            return true
+          }}
+          markRead={async () => {
+            const unread = messages.filter(
+              (m) =>
+                m.requestId === threadId && m.recipientId === userId && !m.readAt,
+            )
+            setReadNotifications((ids) => [
+              ...new Set([...ids, ...unread.map((m) => `msg-${m.id}`)]),
+            ])
+            if (!unread.length) return
+            await supabase
+              .from("messages")
+              .update({ read_at: new Date().toISOString() })
+              .in(
+                "id",
+                unread.map((m) => m.id),
+              )
+            await loadMyData(userId)
+          }}
+        />
+      )}
+      {page === "auth" && (
+        <AuthPage
+          mode={authMode}
+          setMode={setAuthMode}
+          done={(message: string) => {
+            setNotice(message)
+            navigate(afterAuth)
           }}
         />
       )}
@@ -1573,9 +2175,32 @@ function App() {
         <ProfilePage
           location={location}
           setLocation={setLocation}
-          items={items}
+          place={place}
+          choosePlace={choosePlace}
+          items={located}
           requests={requests}
           openItem={openItem}
+          profile={profile}
+          email={session?.user.email}
+          initials={initials}
+          updateProfile={async (fields: Partial<Profile>) => {
+            const { error } = await supabase
+              .from("profiles")
+              .update(fields)
+              .eq("id", userId)
+            if (error) {
+              setNotice("Couldn't save your profile.")
+              return false
+            }
+            await loadMyData(userId)
+            await supabase
+              .from("listings")
+              .update({ lender_name: fields.display_name })
+              .eq("owner_id", userId)
+            await loadListings()
+            setNotice("Profile saved.")
+            return true
+          }}
         />
       )}
       {[
@@ -1610,6 +2235,8 @@ function Onboarding({
   setStep,
   location,
   setLocation,
+  place,
+  choosePlace,
   radius,
   setRadius,
   chosen,
@@ -1630,7 +2257,14 @@ function Onboarding({
       <p>We'll show approximate pickup areas—never exact home addresses.</p>
       <label>
         ZIP code or neighborhood
-        <input value={location} onChange={(e) => setLocation(e.target.value)} />
+        <AddressInput
+          value={location}
+          onChange={setLocation}
+          onSelect={choosePlace}
+          near={place}
+          ariaLabel="ZIP code, neighborhood or address"
+          placeholder="Start typing a ZIP, neighborhood or address"
+        />
       </label>
       <label>
         Borrowing radius
@@ -1761,6 +2395,8 @@ function Explore({
   chooseOccasion,
   chooseCategory,
   setLocation,
+  place,
+  choosePlace,
   start,
   end,
   setStart,
@@ -1812,10 +2448,13 @@ function Explore({
                 <span>Location</span>
                 <div>
                   <LucideIcon name="map-pin" />
-                  <input
+                  <AddressInput
                     value={location}
-                    onChange={(e) => setLocation(e.target.value)}
-                    placeholder="Neighborhood or ZIP code"
+                    onChange={setLocation}
+                    onSelect={choosePlace}
+                    near={place}
+                    ariaLabel="Location"
+                    placeholder="Address, neighborhood or ZIP"
                   />
                 </div>
               </label>
@@ -2001,6 +2640,8 @@ function Results({
   openItem,
   location,
   setLocation,
+  place,
+  choosePlace,
   start,
   end,
   setStart,
@@ -2039,11 +2680,13 @@ function Results({
           onChange={(e) => setQuery(e.target.value)}
           placeholder="Search items"
         />
-        <input
+        <AddressInput
           value={location}
-          onChange={(e) => setLocation(e.target.value)}
-          aria-label="Pickup neighborhood or ZIP code"
-          placeholder="Neighborhood or ZIP code"
+          onChange={setLocation}
+          onSelect={choosePlace}
+          near={place}
+          ariaLabel="Pickup neighborhood or ZIP code"
+          placeholder="Address, neighborhood or ZIP"
         />
         <input
           type="date"
@@ -2439,12 +3082,34 @@ function Activity({
   communityRequests,
   updateCommunityRequest,
   ownerItems,
-  simulateRequest,
+  focusRequestId,
+  openThread,
+  unreadThreads,
   editItem,
   toggleItem,
   removeItem,
 }: any) {
   const myBorrows = requests.filter(isMyBorrow)
+  useEffect(() => {
+    if (!focusRequestId) return
+    const card = document.getElementById(`request-${focusRequestId}`)
+    card?.scrollIntoView({ behavior: "smooth", block: "center" })
+  }, [focusRequestId, requests, tab])
+  const cardProps = (r: Request) => ({
+    id: `request-${r.id}`,
+    className: r.id === focusRequestId ? "focused-request" : undefined,
+  })
+  const messageButton = (r: Request, label: string) => (
+    <button
+      className={unreadThreads.has(r.id) ? "has-unread" : undefined}
+      disabled={!r.ownerId}
+      title={r.ownerId ? undefined : "Sample listings can't receive messages"}
+      onClick={() => openThread(r.id)}
+    >
+      {label}
+      {unreadThreads.has(r.id) && <span className="unread-dot" aria-label="unread" />}
+    </button>
+  )
   const isOwnItem = (r: Request) =>
     ownerItems.some((item: Item) => item.id === r.itemId)
   const lends = requests.filter(
@@ -2453,13 +3118,6 @@ function Activity({
       isOwnItem(r) &&
       ["Upcoming", "Active", "Completed"].includes(r.status),
   )
-  const hasOpenLend = (item: Item) =>
-    requests.some(
-      (r: Request) =>
-        r.itemId === item.id &&
-        !isMyBorrow(r) &&
-        ["Pending approval", "Upcoming", "Active"].includes(r.status),
-    )
   return (
     <main className="activity">
       <span className="eyebrow">MY ACTIVITY</span>
@@ -2558,7 +3216,7 @@ function Activity({
             myBorrows.map((r: Request) => {
               const i = items.find((x: Item) => x.id === r.itemId)
               return (
-                <article key={r.id}>
+                <article key={r.id} {...cardProps(r)}>
                   <img src={i?.image} />
                   <div>
                     <span
@@ -2591,13 +3249,7 @@ function Activity({
                     <button onClick={() => openItem(r.itemId)}>
                       View item
                     </button>
-                    <button
-                      onClick={() =>
-                        alert(`Contact request sent to ${i?.lender}.`)
-                      }
-                    >
-                      Contact neighbor
-                    </button>
+                    {messageButton(r, "Contact neighbor")}
                     <button onClick={support}>Get support</button>
                   </div>
                 </article>
@@ -2639,13 +3291,6 @@ function Activity({
                     <button onClick={() => openItem(item.id)}>
                       View listing
                     </button>
-                    <button
-                      className="simulate-request"
-                      disabled={item.available === false || hasOpenLend(item)}
-                      onClick={() => simulateRequest(item)}
-                    >
-                      Simulate neighbor request
-                    </button>
                     <button onClick={() => editItem(item)}>Edit listing</button>
                     <button onClick={() => toggleItem(item)}>
                       {item.available === false
@@ -2676,7 +3321,7 @@ function Activity({
               .map((r: Request) => {
                 const i = items.find((x: Item) => x.id === r.itemId)
                 return (
-                  <article key={r.id}>
+                  <article key={r.id} {...cardProps(r)}>
                     <img src={i?.image} />
                     <div>
                       <span className="status pending-approval">
@@ -2698,6 +3343,7 @@ function Activity({
                       <button onClick={() => update(r.id, "Declined")}>
                         Decline
                       </button>
+                      {messageButton(r, "Message borrower")}
                     </div>
                   </article>
                 )
@@ -2711,7 +3357,7 @@ function Activity({
               {lends.map((r: Request) => {
                 const i = items.find((x: Item) => x.id === r.itemId)
                 return (
-                  <article key={r.id}>
+                  <article key={r.id} {...cardProps(r)}>
                     <img src={i?.image} alt={i?.name} />
                     <div>
                       <span
@@ -2741,6 +3387,7 @@ function Activity({
                       <button onClick={() => openItem(r.itemId)}>
                         View listing
                       </button>
+                      {messageButton(r, "Message borrower")}
                     </div>
                   </article>
                 )
@@ -2763,20 +3410,54 @@ function EmptyActivity() {
   )
 }
 
-function ShareItem({ add }: any) {
-  const [sharingOption, setSharingOption] = useState<"free" | "fixed" | "wish">(
-    "free",
+function ShareItem({
+  add,
+  save,
+  existing,
+  near,
+}: {
+  add: (item: Item) => void
+  save: (item: Item) => void
+  existing?: Item | null
+  near: Place
+}) {
+  const [pickup, setPickup] = useState(
+    existing?.pickupAddress || existing?.neighborhood || near.label,
   )
-  const [name, setName] = useState("")
-  const [category, setCategory] = useState("Home Essentials")
-  const [brand, setBrand] = useState("")
-  const [color, setColor] = useState("")
-  const [description, setDescription] = useState("")
-  const [preview, setPreview] = useState("")
+  const [pickupPlace, setPickupPlace] = useState<Place | null>(
+    existing?.lat != null && existing?.lng != null
+      ? {
+          label: existing.pickupAddress || existing.neighborhood,
+          lat: existing.lat,
+          lng: existing.lng,
+          neighborhood: existing.neighborhood,
+        }
+      : near,
+  )
+  // When editing, every field starts from the saved listing
+  const [sharingOption, setSharingOption] = useState<"free" | "fixed" | "wish">(
+    existing?.sharingOption ||
+      (existing && existing.price > 0 ? "fixed" : "free"),
+  )
+  const [name, setName] = useState(existing?.name || "")
+  const [category, setCategory] = useState(
+    existing?.category || "Home Essentials",
+  )
+  const [brand, setBrand] = useState(existing?.brand || "")
+  const [color, setColor] = useState(existing?.color || "")
+  const [description, setDescription] = useState(existing?.description || "")
+  const [preview, setPreview] = useState(existing?.image || "")
   const [suggested, setSuggested] = useState(false)
   const [accepted, setAccepted] = useState(false)
-  const [selectedCare, setSelectedCare] = useState<string[]>([])
-  const [customCare, setCustomCare] = useState("")
+  const [selectedCare, setSelectedCare] = useState<string[]>(
+    existing?.careInstructions || [],
+  )
+  const [customCare, setCustomCare] = useState(
+    existing
+      ? existing.customCare ??
+          (existing.careInstructions?.length ? "" : existing.care || "")
+      : "",
+  )
   const [careError, setCareError] = useState("")
 
   const careSuggestions = useMemo(() => {
@@ -2894,19 +3575,22 @@ function ShareItem({ add }: any) {
       return
     }
     const f = new FormData(e.currentTarget)
-    add({
-      id: "user-" + Date.now(),
+    const fields = {
       name,
       category,
-      occasion: "Get Things Done",
       price: sharingOption === "fixed" ? +String(f.get("price")) : 0,
       sharingOption,
       brand,
       color,
       guarantee: +String(f.get("guarantee")),
-      distance: 0.3,
-      lender: "Jamie",
-      neighborhood: String(f.get("neighborhood")),
+      // Only the neighborhood is shown publicly; coordinates power distance
+      neighborhood:
+        pickupPlace && pickupPlace.label === pickup
+          ? pickupPlace.neighborhood
+          : pickup.trim(),
+      pickupAddress: pickup.trim(),
+      lat: pickupPlace?.label === pickup ? pickupPlace.lat : undefined,
+      lng: pickupPlace?.label === pickup ? pickupPlace.lng : undefined,
       image: preview || photos.party,
       description,
       condition: String(f.get("condition")),
@@ -2914,6 +3598,17 @@ function ShareItem({ add }: any) {
       care: [...selectedCare, customCare.trim()].filter(Boolean).join(" • "),
       careInstructions: selectedCare,
       customCare: customCare.trim(),
+    }
+    if (existing) {
+      save({ ...existing, ...fields })
+      return
+    }
+    add({
+      ...fields,
+      id: "user-" + Date.now(),
+      occasion: "Get Things Done",
+      distance: 0.3,
+      lender: "",
       availability: "Available by request",
       source: "community",
     })
@@ -2921,9 +3616,17 @@ function ShareItem({ add }: any) {
   return (
     <main className="share-page">
       <div>
-        <span className="eyebrow">SHARE AN ITEM</span>
-        <h1>Give a good thing more life.</h1>
-        <p>List something you rarely use and help a neighbor do more.</p>
+        <span className="eyebrow">
+          {existing ? "EDIT LISTING" : "SHARE AN ITEM"}
+        </span>
+        <h1>
+          {existing ? "Update your listing." : "Give a good thing more life."}
+        </h1>
+        <p>
+          {existing
+            ? "Change any detail below and save to update your listing."
+            : "List something you rarely use and help a neighbor do more."}
+        </p>
       </div>
       <form onSubmit={submit}>
         <label className="full photo-upload">
@@ -3012,6 +3715,7 @@ function ShareItem({ add }: any) {
           Condition
           <Dropdown
             name="condition"
+            defaultValue={existing?.condition || ""}
             required
             ariaLabel="Item condition"
             options={[
@@ -3027,12 +3731,22 @@ function ShareItem({ add }: any) {
           <input
             required
             name="accessories"
+            defaultValue={existing?.accessories}
             placeholder="Case, charger, attachments..."
           />
         </label>
         <label>
-          Pickup neighborhood
-          <input required name="neighborhood" defaultValue="Hamilton Park" />
+          Pickup location
+          <AddressInput
+            required
+            name="pickup"
+            value={pickup}
+            onChange={setPickup}
+            onSelect={setPickupPlace}
+            near={near}
+            ariaLabel="Pickup location"
+            placeholder="Start typing your pickup address"
+          />
         </label>
         <label>
           Sharing option
@@ -3057,7 +3771,7 @@ function ShareItem({ add }: any) {
               min="1"
               type="number"
               name="price"
-              defaultValue="5"
+              defaultValue={existing?.price || 5}
             />
           </label>
         )}
@@ -3078,7 +3792,7 @@ function ShareItem({ add }: any) {
             min="0"
             type="number"
             name="guarantee"
-            defaultValue="25"
+            defaultValue={existing?.guarantee ?? 25}
           />
         </label>
         <section className="full care-assist">
@@ -3155,15 +3869,283 @@ function ShareItem({ add }: any) {
         </section>
         <div className="full form-foot">
           <small>Your exact address is never shown publicly.</small>
-          <button className="primary">Publish listing →</button>
+          <button className="primary">
+            {existing ? "Save changes →" : "Publish listing →"}
+          </button>
         </div>
       </form>
     </main>
   )
 }
 
+function MessageThread({
+  request,
+  items,
+  messages,
+  userId,
+  close,
+  send,
+  markRead,
+}: {
+  request?: Request
+  items: Item[]
+  messages: Message[]
+  userId: string
+  close: () => void
+  send: (body: string) => Promise<boolean>
+  markRead: () => void
+}) {
+  const [draft, setDraft] = useState("")
+  const [sending, setSending] = useState(false)
+  const listRef = useRef<HTMLDivElement>(null)
+  const item = items.find((i) => i.id === request?.itemId)
+  const iAmBorrower = request ? isMyBorrow(request) : true
+  const neighbor = iAmBorrower
+    ? item?.lender || "your neighbor"
+    : request?.borrowerName || "your neighbor"
+  useEffect(() => {
+    markRead()
+    listRef.current?.scrollTo({ top: listRef.current.scrollHeight })
+  }, [messages.length])
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => event.key === "Escape" && close()
+    document.addEventListener("keydown", onKey)
+    return () => document.removeEventListener("keydown", onKey)
+  }, [])
+  const submit = async (event: FormEvent) => {
+    event.preventDefault()
+    if (!draft.trim() || sending) return
+    setSending(true)
+    if (await send(draft.trim())) setDraft("")
+    setSending(false)
+  }
+  return (
+    <div className="thread-backdrop" onMouseDown={close}>
+      <section
+        className="thread"
+        role="dialog"
+        aria-modal="true"
+        aria-label={`Messages with ${neighbor}`}
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <header>
+          <div>
+            <span className="eyebrow">{item?.name || "Borrow request"}</span>
+            <h2>Message {neighbor}</h2>
+          </div>
+          <button className="thread-close" aria-label="Close" onClick={close}>
+            ×
+          </button>
+        </header>
+        <div className="thread-messages" ref={listRef}>
+          {messages.length ? (
+            messages.map((message) => (
+              <div
+                key={message.id}
+                className={message.senderId === userId ? "mine" : "theirs"}
+              >
+                <p>{message.body}</p>
+                <small>
+                  {message.senderId === userId ? "You" : message.senderName} ·{" "}
+                  {new Date(message.createdAt).toLocaleString(undefined, {
+                    month: "short",
+                    day: "numeric",
+                    hour: "numeric",
+                    minute: "2-digit",
+                  })}
+                </small>
+              </div>
+            ))
+          ) : (
+            <p className="thread-empty">
+              No messages yet. Say hello and sort out pickup details with{" "}
+              {neighbor}.
+            </p>
+          )}
+        </div>
+        <form onSubmit={submit}>
+          <textarea
+            autoFocus
+            value={draft}
+            maxLength={2000}
+            onChange={(event) => setDraft(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && !event.shiftKey) submit(event)
+            }}
+            placeholder={`Write a message to ${neighbor}…`}
+          />
+          <button className="primary" disabled={!draft.trim() || sending}>
+            {sending ? "Sending…" : "Send"}
+          </button>
+        </form>
+      </section>
+    </div>
+  )
+}
+
+function AuthPage({
+  mode,
+  setMode,
+  done,
+}: {
+  mode: "signin" | "signup" | "reset"
+  setMode: (mode: "signin" | "signup" | "reset") => void
+  done: (message: string) => void
+}) {
+  const [name, setName] = useState("")
+  const [email, setEmail] = useState("")
+  const [password, setPassword] = useState("")
+  const [error, setError] = useState("")
+  const [info, setInfo] = useState("")
+  const [busy, setBusy] = useState(false)
+  // Links in sign-up and reset emails come back to this page
+  const returnUrl = window.location.origin + import.meta.env.BASE_URL
+  const submit = async (event: FormEvent) => {
+    event.preventDefault()
+    setError("")
+    setInfo("")
+    setBusy(true)
+    if (mode === "signup") {
+      const { data, error } = await supabase.auth.signUp({
+        email,
+        password,
+        options: {
+          data: { display_name: name.trim() },
+          emailRedirectTo: returnUrl,
+        },
+      })
+      if (error) setError(error.message)
+      else if (data.session) done(`Welcome to Goodshare, ${name.trim()}!`)
+      else
+        setInfo(
+          "Check your inbox for a confirmation link, then come back and sign in.",
+        )
+    } else if (mode === "reset") {
+      const { error } = await supabase.auth.updateUser({ password })
+      if (error) setError(error.message)
+      else done("Password updated.")
+    } else {
+      const { error } = await supabase.auth.signInWithPassword({
+        email,
+        password,
+      })
+      if (error) setError(error.message)
+      else done("Signed in.")
+    }
+    setBusy(false)
+  }
+  const forgot = async () => {
+    setError("")
+    if (!email) {
+      setError("Enter your email first, then tap “Forgot password?”.")
+      return
+    }
+    const { error } = await supabase.auth.resetPasswordForEmail(email, {
+      redirectTo: returnUrl,
+    })
+    if (error) setError(error.message)
+    else setInfo("We sent you a link to reset your password.")
+  }
+  return (
+    <main className="auth-page">
+      <span className="eyebrow">
+        {mode === "signup"
+          ? "JOIN GOODSHARE"
+          : mode === "reset"
+            ? "RESET PASSWORD"
+            : "WELCOME BACK"}
+      </span>
+      <h1>
+        {mode === "signup"
+          ? "Create your account"
+          : mode === "reset"
+            ? "Choose a new password"
+            : "Sign in"}
+      </h1>
+      <p className="auth-intro">
+        {mode === "reset"
+          ? "Enter a new password for your account."
+          : "Sign in to share items, borrow from neighbors and track your exchanges."}
+      </p>
+      <form className="auth-form" onSubmit={submit}>
+        {mode === "signup" && (
+          <label>
+            Your name
+            <input
+              required
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              autoComplete="name"
+              placeholder="How neighbors will see you"
+            />
+          </label>
+        )}
+        {mode !== "reset" && (
+          <label>
+            Email
+            <input
+              required
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              autoComplete="email"
+            />
+          </label>
+        )}
+        <label>
+          {mode === "reset" ? "New password" : "Password"}
+          <input
+            required
+            type="password"
+            minLength={6}
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            autoComplete={mode === "signin" ? "current-password" : "new-password"}
+          />
+        </label>
+        {error && (
+          <p className="auth-error" role="alert">
+            {error}
+          </p>
+        )}
+        {info && <p className="auth-info">{info}</p>}
+        <button className="primary" disabled={busy}>
+          {busy
+            ? "Please wait…"
+            : mode === "signup"
+              ? "Create account"
+              : mode === "reset"
+                ? "Save new password"
+                : "Sign in"}
+        </button>
+        {mode === "signin" && (
+          <button type="button" className="text-btn" onClick={forgot}>
+            Forgot password?
+          </button>
+        )}
+      </form>
+      {mode !== "reset" && (
+        <p className="auth-switch">
+          {mode === "signup" ? "Already have an account?" : "New to Goodshare?"}{" "}
+          <button
+            type="button"
+            className="text-btn"
+            onClick={() => {
+              setError("")
+              setInfo("")
+              setMode(mode === "signup" ? "signin" : "signup")
+            }}
+          >
+            {mode === "signup" ? "Sign in" : "Create an account"}
+          </button>
+        </p>
+      )}
+    </main>
+  )
+}
+
 function InfoPage({ page, navigate }: any) {
-  const content: Record<string, { label: string title: string intro: string }> =
+  const content: Record<string, { label: string; title: string; intro: string }> =
     {
       settings: {
         label: "SETTINGS",
@@ -3305,24 +4287,27 @@ function InfoPage({ page, navigate }: any) {
 function ProfilePage({
   location,
   setLocation,
+  place,
+  choosePlace,
   items,
   requests,
   openItem,
+  profile,
+  email,
+  initials,
+  updateProfile,
 }: any) {
   const [editing, setEditing] = useState(false)
-  const [name, setName] = useState(
-    () => localStorage.getItem("goodshare-profile-name") || "Jamie Smith",
-  )
-  const [bio, setBio] = useState(
-    () =>
-      localStorage.getItem("goodshare-profile-bio") ||
-      "Neighbor, occasional host, and believer in keeping useful things in use.",
-  )
-  const saveProfile = () => {
-    localStorage.setItem("goodshare-profile-name", name)
-    localStorage.setItem("goodshare-profile-bio", bio)
+  const [name, setName] = useState(profile?.display_name || "")
+  const [bio, setBio] = useState(profile?.bio || "")
+  useEffect(() => {
+    setName(profile?.display_name || "")
+    setBio(profile?.bio || "")
+  }, [profile])
+  const saveProfile = async () => {
     localStorage.setItem("goodshare-location", location)
-    setEditing(false)
+    if (await updateProfile({ display_name: name.trim() || "Neighbor", bio }))
+      setEditing(false)
   }
   const myBorrows = requests.filter(isMyBorrow)
   const completed = requests.filter(
@@ -3346,15 +4331,18 @@ function ProfilePage({
   return (
     <main className="profile-page">
       <section className="profile-hero">
-        <div className="profile-avatar">JS</div>
+        <div className="profile-avatar">{initials}</div>
         <div>
           <span className="eyebrow">MY PROFILE</span>
           {editing ? (
             <>
               <input value={name} onChange={(e) => setName(e.target.value)} />
-              <input
+              <AddressInput
                 value={location}
-                onChange={(e) => setLocation(e.target.value)}
+                onChange={setLocation}
+                onSelect={choosePlace}
+                near={place}
+                ariaLabel="Your location"
               />
               <textarea value={bio} onChange={(e) => setBio(e.target.value)} />
             </>
@@ -3378,11 +4366,15 @@ function ProfilePage({
           <h2>Account details</h2>
           <p>
             <b>Email</b>
-            <span>jamie@example.com</span>
+            <span>{email}</span>
           </p>
           <p>
             <b>Member since</b>
-            <span>2025</span>
+            <span>
+              {profile?.created_at
+                ? new Date(profile.created_at).getFullYear()
+                : new Date().getFullYear()}
+            </span>
           </p>
         </article>
         <article>
@@ -3414,10 +4406,10 @@ function ProfilePage({
         </article>
         <article className="profile-wide">
           <h2>My Listings</h2>
-          {items.filter((item: Item) => item.lender === "Jamie").length ? (
+          {items.filter((item: Item) => item.ownerId === currentUserId).length ? (
             <div className="profile-items">
               {items
-                .filter((item: Item) => item.lender === "Jamie")
+                .filter((item: Item) => item.ownerId === currentUserId)
                 .map((item: Item) => (
                   <ItemCard
                     key={item.id}
@@ -3478,10 +4470,10 @@ function Community({ location, requests, addRequest, viewMyRequests }: any) {
         </div>
         <div className="ask-form-wrap">
           <form
-            onSubmit={(e) => {
+            onSubmit={async (e) => {
               e.preventDefault()
               if (!requestItem.trim()) return
-              addRequest({
+              const ok = await addRequest({
                 id: `community-${Date.now()}`,
                 item: requestItem.trim(),
                 posted: new Date().toLocaleDateString(undefined, {
@@ -3494,6 +4486,7 @@ function Community({ location, requests, addRequest, viewMyRequests }: any) {
                 responses: 0,
                 owner: "current",
               } as CommunityRequest)
+              if (!ok) return
               setRequestItem("")
               setPosted(true)
             }}
