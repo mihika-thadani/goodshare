@@ -1,0 +1,14 @@
+{
+  "description": "Discover and borrow everyday essentials, hobby gear, and event supplies from nearby neighbors, while sharing your own items to make more possible together.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  },
+  "title": "Goodshare",
+  "icons": {
+    "icon": "./favicon.svg"
+  }
+}
